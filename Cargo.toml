@@ -36,6 +36,12 @@ xxhash64 = []
 xxhash3_64 = []
 xxhash3_128 = []
 
+# Adds a runtime-detected AVX-512 implementation used when hashing large
+# inputs in one shot. Requires Rust 1.89 or newer, which is why it is
+# not on by default; the rest of the crate builds with the stated
+# `rust-version`.
+avx512 = ["std"]
+
 std = ["alloc"]
 alloc = []
 
@@ -46,6 +52,7 @@ check-cfg = [
     'cfg(_internal_xxhash3_force_neon)',
     'cfg(_internal_xxhash3_force_sse2)',
     'cfg(_internal_xxhash3_force_avx2)',
+    'cfg(_internal_xxhash3_force_avx512)',
 ]
 
 [lints.clippy]

@@ -347,6 +347,7 @@ fn impl_129_to_240_bytes(secret: &Secret, seed: u64, input: &[u8]) -> u64 {
 fn impl_241_plus_bytes(secret: &Secret, input: &[u8]) -> u64 {
     assert_input_range!(241.., input.len());
     dispatch! {
+        avx512,
         fn oneshot_impl<>(secret: &Secret, input: &[u8]) -> u64
         []
     }

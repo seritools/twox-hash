@@ -44,6 +44,13 @@ jobs:
 
       - name: Unit Tests
         run: cargo test --all-features
+        if: ${{ matrix.rust != '1.81.0' }}
+
+      # `avx512` needs a newer compiler than the MSRV, so it is left out
+      # here; the other toolchains cover it via `--all-features`.
+      - name: Unit Tests (MSRV)
+        run: cargo test --features xxhash32,xxhash64,xxhash3_64,xxhash3_128,random,serialize,std,alloc
+        if: ${{ matrix.rust == '1.81.0' }}
 
       - name: Property Tests
         run: cargo test -p comparison --all-features
@@ -180,4 +187,5 @@ jobs:
         run: |
           cargo +nightly -Z minimal-versions update
 
-      - run: cargo +1.81.0 build --all-features
+      # See the note on the MSRV unit tests about `avx512`.
+      - run: cargo +1.81.0 build --features xxhash32,xxhash64,xxhash3_64,xxhash3_128,random,serialize,std,alloc

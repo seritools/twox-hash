@@ -18,10 +18,61 @@ pub mod neon;
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 pub mod avx2;
 
+#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+pub mod avx512;
+
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
 pub mod sse2;
 
 macro_rules! dispatch {
+    // AVX-512 only pays off where the block loop is unrolled and the
+    // secret is a compile-time constant: there it roughly halves the
+    // instruction count. The streaming path runs short bursts of
+    // stripes against a runtime secret, where the accumulator
+    // dependency chain dominates and folding the two independent
+    // 256-bit chains into one 512-bit chain measures slower. So it is
+    // opted into per call site rather than applied to every dispatch.
+    (
+        avx512,
+        fn $fn_name:ident<$($gen:ident),*>($($arg_name:ident : $arg_ty:ty),*) $(-> $ret_ty:ty)?
+        [$($wheres:tt)*]
+    ) => {
+        /// # Safety
+        ///
+        /// You must ensure that the CPU has the AVX512F feature
+        #[inline]
+        #[target_feature(enable = "avx512f")]
+        #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+        unsafe fn do_avx512<$($gen),*>($($arg_name : $arg_ty),*) $(-> $ret_ty)?
+        where
+            $($wheres)*
+        {
+            // Safety: The caller has ensured we have the AVX512F feature
+            unsafe {
+                $fn_name($crate::xxhash3::large::avx512::Impl::new_unchecked(), $($arg_name),*)
+            }
+        }
+
+        #[cfg(all(_internal_xxhash3_force_avx512, feature = "avx512"))]
+        return unsafe { do_avx512($($arg_name),*) };
+
+        #[allow(unreachable_code)]
+        {
+            #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+            {
+                if is_x86_feature_detected!("avx512f") {
+                    // Safety: We just ensured we have the AVX512F feature
+                    return unsafe { do_avx512($($arg_name),*) };
+                }
+            }
+
+            $crate::xxhash3::large::dispatch! {
+                fn $fn_name<$($gen),*>($($arg_name : $arg_ty),*) $(-> $ret_ty)?
+                [$($wheres)*]
+            }
+        }
+    };
+
     (
         fn $fn_name:ident<$($gen:ident),*>($($arg_name:ident : $arg_ty:ty),*) $(-> $ret_ty:ty)?
         [$($wheres:tt)*]

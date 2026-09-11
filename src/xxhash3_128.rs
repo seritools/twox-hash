@@ -415,6 +415,7 @@ fn finalize_medium(acc: [u64; 2], input_len: u64, seed: u64) -> u128 {
 fn impl_241_plus_bytes(secret: &Secret, input: &[u8]) -> u128 {
     assert_input_range!(241.., input.len());
     dispatch! {
+        avx512,
         fn oneshot_impl<>(secret: &Secret, input: &[u8]) -> u128
         []
     }

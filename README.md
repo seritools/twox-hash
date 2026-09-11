@@ -92,6 +92,7 @@ assert_eq!(hash.get(&42), Some(&"the answer"));
 | serialize   | Serialize and deserialize hasher state with Serde                                                                             |
 | std         | Use the Rust standard library. Enable this if you want SIMD support in [`XxHash3_64`][] or [`XxHash3_128`][]                  |
 | alloc       | Use the Rust allocator library. Enable this if you want to create [`XxHash3_64`][] or [`XxHash3_128`][]  with dynamic secrets |
+| avx512      | Add a runtime-detected AVX-512 implementation for one-shot hashing of large inputs. Requires Rust 1.89 or newer               |
 
 # Benchmarks
 
