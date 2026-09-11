@@ -48,21 +48,14 @@ impl Hasher {
     #[must_use]
     #[inline]
     pub fn oneshot_with_seed(seed: u64, input: &[u8]) -> u64 {
-        // Short inputs use the default secret directly, without copying it.
-        if input.len() <= CUTOFF {
-            return impl_oneshot(DEFAULT_SECRET, seed, input);
+        // As in `oneshot`, the bulky long-input code is kept out of
+        // line so that hashing a short input stays cheap.
+        if input.len() > 128 {
+            return oneshot_with_seed_long(seed, input);
         }
 
-        let mut derived_secret;
-        let secret = if seed != DEFAULT_SEED {
-            derived_secret = DEFAULT_SECRET_RAW;
-            derive_secret(seed, &mut derived_secret);
-            Secret::new(&derived_secret).expect("The default secret length is invalid")
-        } else {
-            DEFAULT_SECRET
-        };
-
-        impl_241_plus_bytes(secret, input)
+        // Short inputs use the default secret directly, without copying it.
+        impl_oneshot(DEFAULT_SECRET, seed, input)
     }
 
     /// Hash all data at once using the provided secret and the
@@ -215,6 +208,27 @@ impl Finalize for Finalize64 {
     ) -> Self::Output {
         Algorithm(vector).finalize_64(acc, last_block, last_stripe, secret, len)
     }
+}
+
+#[inline(never)]
+fn oneshot_with_seed_long(seed: u64, input: &[u8]) -> u64 {
+    // Below the cutoff a derived secret goes unread, and deriving with
+    // the default seed reproduces the default secret, so both of those
+    // cases use the constant rather than building a copy on the stack.
+    if input.len() <= CUTOFF {
+        return impl_oneshot(DEFAULT_SECRET, seed, input);
+    }
+
+    let mut derived_secret;
+    let secret = if seed != DEFAULT_SEED {
+        derived_secret = DEFAULT_SECRET_RAW;
+        derive_secret(seed, &mut derived_secret);
+        Secret::new(&derived_secret).expect("The default secret length is invalid")
+    } else {
+        DEFAULT_SECRET
+    };
+
+    impl_241_plus_bytes(secret, input)
 }
 
 #[inline(never)]
