@@ -48,11 +48,22 @@ impl Secret {
         Secret128BitView(self)
     }
 
+    /// The prefix that every input below the 241-byte cutoff reads
+    /// from. Handing the short paths a fixed-size array tells the
+    /// compiler how many secret words there are to walk, which it
+    /// otherwise has to rediscover from the secret's length on every
+    /// call.
     #[inline]
-    pub fn words_for_17_to_128(&self) -> &[[u8; 16]] {
+    pub fn short(&self) -> &[u8; SECRET_MINIMUM_LENGTH] {
         self.reassert_preconditions();
 
-        let (words, _) = self.0.bp_as_chunks();
+        // Safety: A valid secret is at least this long.
+        unsafe { self.0.first_chunk().unwrap_unchecked() }
+    }
+
+    #[inline]
+    pub fn words_for_17_to_128(&self) -> &[[u8; 16]] {
+        let (words, _) = self.short().bp_as_chunks();
         words
     }
 
@@ -181,8 +192,8 @@ impl<'a> Secret64BitView<'a> {
         self.b()[119..].first_chunk().unwrap()
     }
 
-    fn b(self) -> &'a [u8] {
-        &(self.0).0
+    fn b(self) -> &'a [u8; SECRET_MINIMUM_LENGTH] {
+        self.0.short()
     }
 }
 
