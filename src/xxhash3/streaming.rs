@@ -171,6 +171,21 @@ where
 {
     #[inline]
     pub fn write(&mut self, input: &[u8]) {
+        // A write that fits entirely in the buffer never touches the
+        // accumulator, so it can skip the CPU feature dispatch and
+        // the code it pulls in.
+        let usage = self.buffer_usage;
+        if let Some(dest) = self
+            .secret_buffer
+            .buffer
+            .get_mut(usage..usage + input.len())
+        {
+            dest.copy_from_slice(input);
+            self.buffer_usage = usage + input.len();
+            self.total_bytes += input.len();
+            return;
+        }
+
         let this = self;
         dispatch! {
             fn write_impl<S>(this: &mut RawHasherCore<S>, input: &[u8])
@@ -242,9 +257,7 @@ where
         }
 
         let (stripes, _) = buffer.bp_as_chunks();
-        for stripe in stripes {
-            stripe_accumulator.process_stripe(vector, stripe, n_stripes, secret);
-        }
+        stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
         *buffer_usage = 0;
     }
 
@@ -265,9 +278,7 @@ where
         let (stripes, remainder) = unsafe { input.split_at_unchecked(full_block_point) };
         let (stripes, _) = stripes.bp_as_chunks();
 
-        for stripe in stripes {
-            stripe_accumulator.process_stripe(vector, stripe, n_stripes, secret);
-        }
+        stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
         input = remainder;
     }
 
@@ -316,9 +327,7 @@ where
 
         // Ingest final stripes
         let (stripes, remainder) = stripes_with_tail(input);
-        for stripe in stripes {
-            stripe_accumulator.process_stripe(vector, stripe, n_stripes, secret);
-        }
+        stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
 
         let mut temp = [0; 64];
 
@@ -453,36 +462,63 @@ impl StripeAccumulator {
         }
     }
 
+    /// Copying the accumulator into a local lets the compiler keep it
+    /// in registers for the whole run of stripes instead of
+    /// round-tripping it through memory once per stripe.
     #[inline]
-    pub fn process_stripe(
+    pub fn process_stripes(
         &mut self,
         vector: impl Vector,
-        stripe: &[u8; 64],
+        mut stripes: &[[u8; 64]],
         n_stripes: usize,
         secret: &Secret,
     ) {
+        if stripes.is_empty() {
+            return;
+        }
+
         let Self {
             accumulator,
             current_stripe,
-            ..
         } = self;
 
-        // For each stripe
+        let mut acc = *accumulator;
+        let mut current = *current_stripe;
 
-        // Safety: The number of stripes is determined by the
-        // block size, which is determined by the secret size.
-        let secret_stripe = unsafe { secret.stripe(*current_stripe) };
-        vector.accumulate(accumulator, stripe, secret_stripe);
-
-        *current_stripe += 1;
-
-        // After a full block's worth
-        if *current_stripe == n_stripes {
-            let secret_end = secret.last_stripe();
-            vector.round_scramble(accumulator, secret_end);
-
-            *current_stripe = 0;
+        // Safety: every caller derives `n_stripes` from the same
+        // secret, and `current_stripe` is reset to zero as soon as it
+        // reaches that value.
+        unsafe {
+            debug_assert!(current < n_stripes);
+            assert_unchecked(current < n_stripes);
         }
+
+        while !stripes.is_empty() {
+            let n = usize::min(n_stripes - current, stripes.len());
+            // Safety: `n` is at most `stripes.len()`.
+            let (head, tail) = unsafe { stripes.split_at_unchecked(n) };
+
+            for (i, stripe) in head.iter().enumerate() {
+                // Safety: The number of stripes is determined by the
+                // block size, which is determined by the secret size.
+                let secret_stripe = unsafe { secret.stripe(current + i) };
+                vector.accumulate(&mut acc, stripe, secret_stripe);
+            }
+
+            current += n;
+            stripes = tail;
+
+            // After a full block's worth
+            if current == n_stripes {
+                let secret_end = secret.last_stripe();
+                vector.round_scramble(&mut acc, secret_end);
+
+                current = 0;
+            }
+        }
+
+        *accumulator = acc;
+        *current_stripe = current;
     }
 }
 
