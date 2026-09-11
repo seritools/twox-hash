@@ -32,6 +32,13 @@ impl Hasher {
     #[must_use]
     #[inline]
     pub fn oneshot(input: &[u8]) -> u64 {
+        // Hashing a short input is latency sensitive, so the bulky
+        // long-input code is kept out of line. Both arms still see a
+        // constant secret, which is what lets the long path specialize.
+        if input.len() > 128 {
+            return oneshot_long(input);
+        }
+
         impl_oneshot(DEFAULT_SECRET, DEFAULT_SEED, input)
     }
 
@@ -204,6 +211,11 @@ impl Finalize for Finalize64 {
     ) -> Self::Output {
         Algorithm(vector).finalize_64(acc, last_block, last_stripe, secret, len)
     }
+}
+
+#[inline(never)]
+fn oneshot_long(input: &[u8]) -> u64 {
+    impl_oneshot(DEFAULT_SECRET, DEFAULT_SEED, input)
 }
 
 #[inline(always)]
