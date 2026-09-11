@@ -1,4 +1,4 @@
-use core::hint::assert_unchecked;
+use core::{hint::assert_unchecked, mem::MaybeUninit};
 
 use super::{large::INITIAL_ACCUMULATORS, *};
 
@@ -35,11 +35,16 @@ unsafe impl<const N: usize> FixedMutBuffer for &mut [u8; N] {}
 
 const STRIPE_BYTES: usize = 64;
 // Only writes that overflow the buffer do any work, so a larger one
-// makes a run of small writes cheaper. Past this size the cost of
-// clearing it starts to show up when a hasher is short-lived.
-const BUFFERED_STRIPES: usize = 8;
+// makes a run of small writes cheaper. It costs nothing to create,
+// being left uninitialized, so the price is the size of the hasher
+// itself; returns flatten out around here.
+const BUFFERED_STRIPES: usize = 32;
 const BUFFERED_BYTES: usize = STRIPE_BYTES * BUFFERED_STRIPES;
-type Buffer = [u8; BUFFERED_BYTES];
+/// The buffer is only ever read back as far as it has been written, so
+/// there is no reason to pay to clear it when a hasher is created.
+type Buffer = [MaybeUninit<u8>; BUFFERED_BYTES];
+
+const UNWRITTEN_BUFFER: Buffer = [MaybeUninit::uninit(); BUFFERED_BYTES];
 
 // Ensure that a full buffer always implies we are in the 241+ byte case.
 const _: () = assert!(BUFFERED_BYTES > CUTOFF);
@@ -51,6 +56,10 @@ pub struct SecretBuffer<S> {
     seed: u64,
     secret: S,
     buffer: Buffer,
+    /// The stripe of input immediately preceding the buffered bytes.
+    /// Finalizing with a buffered tail shorter than a stripe needs the
+    /// bytes in front of it, and they have long since been consumed.
+    preceding_stripe: [u8; STRIPE_BYTES],
 }
 
 impl<S> SecretBuffer<S> {
@@ -72,7 +81,8 @@ where
             Ok(_) => Ok(Self {
                 seed,
                 secret,
-                buffer: [0; BUFFERED_BYTES],
+                buffer: UNWRITTEN_BUFFER,
+                preceding_stripe: [0; STRIPE_BYTES],
             }),
             Err(e) => Err(SecretTooShortError(e, secret)),
         }
@@ -92,13 +102,23 @@ where
     }
 
     #[inline]
-    fn parts(&self) -> (u64, &Secret, &Buffer) {
-        (self.seed, Self::secret(&self.secret), &self.buffer)
+    fn parts(&self) -> (u64, &Secret, &Buffer, &[u8; STRIPE_BYTES]) {
+        (
+            self.seed,
+            Self::secret(&self.secret),
+            &self.buffer,
+            &self.preceding_stripe,
+        )
     }
 
     #[inline]
-    fn parts_mut(&mut self) -> (u64, &Secret, &mut Buffer) {
-        (self.seed, Self::secret(&self.secret), &mut self.buffer)
+    fn parts_mut(&mut self) -> (u64, &Secret, &mut Buffer, &mut [u8; STRIPE_BYTES]) {
+        (
+            self.seed,
+            Self::secret(&self.secret),
+            &mut self.buffer,
+            &mut self.preceding_stripe,
+        )
     }
 
     fn secret(secret: &S) -> &Secret {
@@ -125,7 +145,8 @@ where
                 Ok(Self {
                     seed,
                     secret,
-                    buffer: [0; BUFFERED_BYTES],
+                    buffer: UNWRITTEN_BUFFER,
+                    preceding_stripe: [0; STRIPE_BYTES],
                 })
             }
             Err(_) => Err(SecretWithSeedError(secret)),
@@ -140,7 +161,8 @@ impl SecretBuffer<&'static [u8; DEFAULT_SECRET_LENGTH]> {
         SecretBuffer {
             seed: DEFAULT_SEED,
             secret: &DEFAULT_SECRET_RAW,
-            buffer: [0; BUFFERED_BYTES],
+            buffer: UNWRITTEN_BUFFER,
+            preceding_stripe: [0; STRIPE_BYTES],
         }
     }
 }
@@ -166,6 +188,16 @@ impl<S> RawHasherCore<S> {
     pub fn into_secret(self) -> S {
         self.secret_buffer.into_secret()
     }
+
+    #[cfg(test)]
+    pub fn buffered_len(&self) -> usize {
+        self.buffer_usage
+    }
+
+    #[cfg(test)]
+    pub fn buffer_capacity(&self) -> usize {
+        self.secret_buffer.buffer.len()
+    }
 }
 
 impl<S> RawHasherCore<S>
@@ -183,7 +215,7 @@ where
             .buffer
             .get_mut(usage..usage + input.len())
         {
-            dest.copy_from_slice(input);
+            write_bytes(dest, input);
             self.buffer_usage = usage + input.len();
             self.total_bytes += input.len();
             return;
@@ -209,6 +241,30 @@ where
     }
 }
 
+/// Copies into a not-yet-written part of the buffer.
+#[inline(always)]
+fn write_bytes(dest: &mut [MaybeUninit<u8>], src: &[u8]) {
+    debug_assert_eq!(dest.len(), src.len());
+
+    // Safety: `MaybeUninit<u8>` has the same layout as `u8` and the
+    // slices are the same length. Writing never reads `dest`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dest.as_mut_ptr().cast::<u8>(), src.len());
+    }
+}
+
+/// # Safety
+///
+/// The first `len` bytes of the buffer must have been written.
+#[inline(always)]
+unsafe fn written_bytes(buffer: &Buffer, len: usize) -> &[u8] {
+    debug_assert!(len <= buffer.len());
+
+    // Safety: The caller has ensured these bytes were written, and
+    // `MaybeUninit<u8>` has the same layout as `u8`.
+    unsafe { core::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), len) }
+}
+
 #[inline(always)]
 fn write_impl<S>(vector: impl Vector, this: &mut RawHasherCore<S>, mut input: &[u8])
 where
@@ -226,7 +282,7 @@ where
     } = this;
 
     let n_stripes = secret_buffer.n_stripes();
-    let (_, secret, buffer) = secret_buffer.parts_mut();
+    let (_, secret, buffer, preceding_stripe) = secret_buffer.parts_mut();
 
     *total_bytes += input.len();
 
@@ -256,15 +312,20 @@ where
         // a position within it up to one cannot leave the buffer.
         let buffer_head = unsafe { buffer.get_unchecked_mut(*buffer_usage..stripe_point) };
 
-        buffer_head.copy_from_slice(input_head);
+        write_bytes(buffer_head, input_head);
         input = input_tail;
 
-        // Safety: As above.
-        let filled = unsafe { buffer.get_unchecked(..stripe_point) };
+        // Safety: Everything up to `stripe_point` has been written:
+        // `buffer_usage` bytes were already there and we just filled
+        // out the rest of the stripe.
+        let filled = unsafe { written_bytes(buffer, stripe_point) };
         let (stripes, _) = filled.bp_as_chunks();
 
         stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
         *buffer_usage = 0;
+
+        // Safety: `filled` is a non-zero multiple of `STRIPE_BYTES`.
+        *preceding_stripe = unsafe { *filled.last_chunk().unwrap_unchecked() };
     }
 
     debug_assert!(*buffer_usage == 0);
@@ -288,21 +349,8 @@ where
 
         stripe_accumulator.process_stripes(vector, chunked_stripes, n_stripes, secret);
 
-        // Finalizing with fewer than `STRIPE_BYTES` buffered rebuilds
-        // the last stripe from the end of the buffer, so keep the
-        // bytes that precede the buffered tail there. The tail only
-        // ever grows, so a long enough one will never need this.
-        if remainder.len() < STRIPE_BYTES {
-            // Safety: `stripes` is a non-zero multiple of
-            // `STRIPE_BYTES` and the buffer is a whole number of
-            // stripes.
-            unsafe {
-                let last_stripe: &[u8; STRIPE_BYTES] = stripes.last_chunk().unwrap_unchecked();
-                let buffer_tail: &mut [u8; STRIPE_BYTES] =
-                    buffer.last_chunk_mut().unwrap_unchecked();
-                *buffer_tail = *last_stripe;
-            }
-        }
+        // Safety: `stripes` is a non-zero multiple of `STRIPE_BYTES`.
+        *preceding_stripe = unsafe { *stripes.last_chunk().unwrap_unchecked() };
 
         input = remainder;
     }
@@ -320,7 +368,7 @@ where
         buffer.get_unchecked_mut(..input.len())
     };
 
-    buffer_head.copy_from_slice(input);
+    write_bytes(buffer_head, input);
     *buffer_usage = input.len();
 }
 
@@ -338,7 +386,7 @@ where
     } = *this;
 
     let n_stripes = secret_buffer.n_stripes();
-    let (seed, secret, buffer) = secret_buffer.parts();
+    let (seed, secret, buffer, preceding_stripe) = secret_buffer.parts();
 
     // Safety: This is an invariant of the buffer.
     unsafe {
@@ -346,8 +394,11 @@ where
         assert_unchecked(buffer_usage <= buffer.len());
     }
 
+    // Safety: This is the invariant the buffer is maintained under.
+    let buffered = unsafe { written_bytes(buffer, buffer_usage) };
+
     if total_bytes > CUTOFF {
-        let input = &buffer[..buffer_usage];
+        let input = buffered;
 
         // Ingest final stripes
         let (stripes, remainder) = stripes_with_tail(input);
@@ -359,10 +410,10 @@ where
             Some(chunk) => chunk,
             None => {
                 let n_to_reuse = 64 - input.len();
-                let to_reuse = buffer.len() - n_to_reuse;
+                let to_reuse = preceding_stripe.len() - n_to_reuse;
 
                 let (temp_head, temp_tail) = temp.split_at_mut(n_to_reuse);
-                temp_head.copy_from_slice(&buffer[to_reuse..]);
+                temp_head.copy_from_slice(&preceding_stripe[to_reuse..]);
                 temp_tail.copy_from_slice(input);
 
                 &temp
@@ -378,7 +429,10 @@ where
             total_bytes,
         )
     } else {
-        finalize.small(DEFAULT_SECRET, seed, &buffer[..total_bytes])
+        // Safety: Below the cutoff every byte written is still buffered.
+        finalize.small(DEFAULT_SECRET, seed, unsafe {
+            written_bytes(buffer, total_bytes)
+        })
     }
 }
 
@@ -420,7 +474,8 @@ pub mod with_alloc {
             Self {
                 seed: DEFAULT_SEED,
                 secret: DEFAULT_SECRET_RAW.to_vec().into(),
-                buffer: [0; BUFFERED_BYTES],
+                buffer: UNWRITTEN_BUFFER,
+                preceding_stripe: [0; STRIPE_BYTES],
             }
         }
 
@@ -433,7 +488,8 @@ pub mod with_alloc {
             Self {
                 seed,
                 secret: secret.to_vec().into(),
-                buffer: [0; BUFFERED_BYTES],
+                buffer: UNWRITTEN_BUFFER,
+                preceding_stripe: [0; STRIPE_BYTES],
             }
         }
 

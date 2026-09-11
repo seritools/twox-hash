@@ -407,6 +407,57 @@ mod test {
         hasher.finish()
     }
 
+    /// Finalizing with a buffered tail shorter than a stripe has to
+    /// rebuild the last stripe from the bytes in front of it, which
+    /// were consumed long ago. Walk over chunk sizes and totals around
+    /// the buffer's capacity to land on every possible tail length.
+    #[test]
+    fn streaming_any_chunking_matches_oneshot() {
+        let capacity = Hasher::new().inner.buffer_capacity();
+
+        let data: Vec<u8> = (0..(capacity * 2 + 512) as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        let totals = [
+            CUTOFF + 1,
+            capacity - 1,
+            capacity,
+            capacity + 1,
+            capacity + 63,
+            capacity + 64,
+            capacity + 65,
+            capacity * 2,
+            capacity * 2 + 1,
+            data.len(),
+        ];
+        let chunks = [
+            1, 7, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 511, 512,
+        ];
+
+        let mut short_tails = 0;
+
+        for total in totals {
+            let input = &data[..total];
+            let expected = Hasher::oneshot(input);
+
+            for chunk in chunks {
+                let mut hasher = Hasher::new();
+                for part in input.chunks(chunk) {
+                    hasher.write(part);
+                }
+
+                if hasher.inner.buffered_len() < 64 {
+                    short_tails += 1;
+                }
+
+                assert_eq!(hasher.finish(), expected, "total {total}, chunk {chunk}");
+            }
+        }
+
+        assert!(short_tails > 0, "never exercised the rebuilt last stripe");
+    }
+
     #[test]
     fn oneshot_empty() {
         let hash = Hasher::oneshot(&EMPTY_BYTES);
