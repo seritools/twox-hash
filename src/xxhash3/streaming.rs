@@ -234,7 +234,7 @@ where
     }
 
     // We have some previous data saved; try to fill it up and process it first
-    if !buffer.is_empty() {
+    if *buffer_usage != 0 {
         let remaining = &mut buffer[*buffer_usage..];
         let n_to_copy = usize::min(remaining.len(), input.len());
 
@@ -263,36 +263,55 @@ where
 
     debug_assert!(*buffer_usage == 0);
 
-    // Process as much of the input data in-place as possible,
-    // while leaving at least one full stripe for the
-    // finalization.
-    if let Some(len) = input.len().checked_sub(STRIPE_BYTES) {
-        let full_block_point = (len / STRIPE_BYTES) * STRIPE_BYTES;
-        // Safety: We know that `full_block_point` must be less than
-        // `input.len()` as we subtracted and then integer-divided
-        // (which rounds down) and then multiplied back. That's not
-        // evident to the compiler and `split_at` results in a
-        // potential panic.
+    // Process whole buffers' worth of the input in place. Whatever is
+    // left has to be copied twice, once into the buffer now and once
+    // back out on a later write, so leaving as much of it as possible
+    // for a single later pass beats trimming it down to a stripe.
+    if input.len() > BUFFERED_BYTES {
+        // Stopping a byte short of the end keeps at least one stripe
+        // that the accumulation loop has not already consumed, which
+        // is what the finalization needs.
+        let full_buffer_point = ((input.len() - 1) / BUFFERED_BYTES) * BUFFERED_BYTES;
+        // Safety: We subtracted and then integer-divided (which
+        // rounds down) and then multiplied back, so this must be less
+        // than `input.len()`. That's not evident to the compiler and
+        // `split_at` results in a potential panic.
         //
         // https://github.com/llvm/llvm-project/issues/104827
-        let (stripes, remainder) = unsafe { input.split_at_unchecked(full_block_point) };
-        let (stripes, _) = stripes.bp_as_chunks();
+        let (stripes, remainder) = unsafe { input.split_at_unchecked(full_buffer_point) };
+        let (chunked_stripes, _) = stripes.bp_as_chunks();
 
-        stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
+        stripe_accumulator.process_stripes(vector, chunked_stripes, n_stripes, secret);
+
+        // Finalizing with fewer than `STRIPE_BYTES` buffered rebuilds
+        // the last stripe from the end of the buffer, so keep the
+        // bytes that precede the buffered tail there. The tail only
+        // ever grows, so a long enough one will never need this.
+        if remainder.len() < STRIPE_BYTES {
+            // Safety: `stripes` is a non-zero multiple of
+            // `STRIPE_BYTES` and the buffer is a whole number of
+            // stripes.
+            unsafe {
+                let last_stripe: &[u8; STRIPE_BYTES] = stripes.last_chunk().unwrap_unchecked();
+                let buffer_tail: &mut [u8; STRIPE_BYTES] =
+                    buffer.last_chunk_mut().unwrap_unchecked();
+                *buffer_tail = *last_stripe;
+            }
+        }
+
         input = remainder;
     }
 
-    // Any remaining data has to be less than the buffer, and the
-    // buffer is empty so just fill up the buffer.
+    // Any remaining data fits in the buffer, and the buffer is empty,
+    // so just fill up the buffer.
     debug_assert!(*buffer_usage == 0);
     debug_assert!(!input.is_empty());
 
-    // Safety: We have parsed all the full blocks of input except one
-    // and potentially a full block minus one byte. That amount of
-    // data must be less than the buffer.
+    // Safety: We either had no more than a buffer's worth of input to
+    // begin with or we consumed every whole buffer's worth but the
+    // last.
     let buffer_head = unsafe {
-        debug_assert!(input.len() < 2 * STRIPE_BYTES);
-        debug_assert!(2 * STRIPE_BYTES < buffer.len());
+        debug_assert!(input.len() <= buffer.len());
         buffer.get_unchecked_mut(..input.len())
     };
 
