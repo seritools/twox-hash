@@ -34,7 +34,10 @@ unsafe impl<const N: usize> FixedBuffer for &mut [u8; N] {}
 unsafe impl<const N: usize> FixedMutBuffer for &mut [u8; N] {}
 
 const STRIPE_BYTES: usize = 64;
-const BUFFERED_STRIPES: usize = 4;
+// Only writes that overflow the buffer do any work, so a larger one
+// makes a run of small writes cheaper. Past this size the cost of
+// clearing it starts to show up when a hasher is short-lived.
+const BUFFERED_STRIPES: usize = 8;
 const BUFFERED_BYTES: usize = STRIPE_BYTES * BUFFERED_STRIPES;
 type Buffer = [u8; BUFFERED_BYTES];
 
@@ -233,45 +236,47 @@ where
         assert_unchecked(*buffer_usage <= buffer.len());
     }
 
-    // We have some previous data saved; try to fill it up and process it first
+    // We have some previous data saved. Top it up to a whole number of
+    // stripes and consume those; filling the rest of the buffer would
+    // only copy bytes that the code below can read straight from the
+    // input.
     if *buffer_usage != 0 {
-        let remaining = &mut buffer[*buffer_usage..];
-        let n_to_copy = usize::min(remaining.len(), input.len());
+        let stripe_point = buffer_usage.next_multiple_of(STRIPE_BYTES);
+        let n_to_copy = stripe_point - *buffer_usage;
 
-        let (remaining_head, remaining_tail) = remaining.split_at_mut(n_to_copy);
-        let (input_head, input_tail) = input.split_at(n_to_copy);
+        // `write` has already handled everything that fits in the
+        // buffer, so there is always enough input to finish the stripe
+        // and more left over afterwards.
+        debug_assert!(input.len() > n_to_copy);
 
-        remaining_head.copy_from_slice(input_head);
-        *buffer_usage += n_to_copy;
+        // Safety: As above.
+        let (input_head, input_tail) = unsafe { input.split_at_unchecked(n_to_copy) };
 
+        // Safety: The buffer is a whole number of stripes, so rounding
+        // a position within it up to one cannot leave the buffer.
+        let buffer_head = unsafe { buffer.get_unchecked_mut(*buffer_usage..stripe_point) };
+
+        buffer_head.copy_from_slice(input_head);
         input = input_tail;
 
-        // We did not fill up the buffer
-        if !remaining_tail.is_empty() {
-            return;
-        }
+        // Safety: As above.
+        let filled = unsafe { buffer.get_unchecked(..stripe_point) };
+        let (stripes, _) = filled.bp_as_chunks();
 
-        // We don't know this isn't the last of the data
-        if input.is_empty() {
-            return;
-        }
-
-        let (stripes, _) = buffer.bp_as_chunks();
         stripe_accumulator.process_stripes(vector, stripes, n_stripes, secret);
         *buffer_usage = 0;
     }
 
     debug_assert!(*buffer_usage == 0);
 
-    // Process whole buffers' worth of the input in place. Whatever is
-    // left has to be copied twice, once into the buffer now and once
-    // back out on a later write, so leaving as much of it as possible
-    // for a single later pass beats trimming it down to a stripe.
-    if input.len() > BUFFERED_BYTES {
+    // Process the input in place, down to the last stripe. Anything
+    // left over gets copied into the buffer and back out again later,
+    // so there is no reason to leave more than we have to.
+    if input.len() > STRIPE_BYTES {
         // Stopping a byte short of the end keeps at least one stripe
         // that the accumulation loop has not already consumed, which
         // is what the finalization needs.
-        let full_buffer_point = ((input.len() - 1) / BUFFERED_BYTES) * BUFFERED_BYTES;
+        let full_buffer_point = ((input.len() - 1) / STRIPE_BYTES) * STRIPE_BYTES;
         // Safety: We subtracted and then integer-divided (which
         // rounds down) and then multiplied back, so this must be less
         // than `input.len()`. That's not evident to the compiler and
