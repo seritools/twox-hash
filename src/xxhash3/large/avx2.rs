@@ -56,6 +56,8 @@ unsafe fn accumulate_avx2(acc: &mut [u64; 8], stripe: &[u8; 64], secret: &[u8; 6
     // stores. Data manipulation is otherwise done on
     // intermediate values.
     unsafe {
+        _mm_prefetch::<_MM_HINT_T0>(stripe.cast::<i8>().wrapping_add(384));
+
         for i in 0..2 {
             // [align-acc]: The C code aligns the accumulator to avoid
             // the unaligned load and store here, but that doesn't
@@ -70,17 +72,16 @@ unsafe fn accumulate_avx2(acc: &mut [u64; 8], stripe: &[u8; 64], secret: &[u8; 6
             // stripe_swap[i] = stripe[i ^ 1]
             let stripe_swap_0 = _mm256_shuffle_epi32::<0b01_00_11_10>(stripe_0);
 
-            // acc[i] += stripe_swap[i]
-            acc_0 = _mm256_add_epi64(acc_0, stripe_swap_0);
-
             // value_shift[i] = value[i] >> 32
             let value_shift_0 = _mm256_srli_epi64::<32>(value_0);
 
             // product[i] = lower_32_bit(value[i]) * lower_32_bit(value_shift[i])
             let product_0 = _mm256_mul_epu32(value_0, value_shift_0);
 
-            // acc[i] += product[i]
-            acc_0 = _mm256_add_epi64(acc_0, product_0);
+            // acc[i] += stripe_swap[i] + product[i]
+            let mut sum_0 = _mm256_add_epi64(stripe_swap_0, product_0);
+            core::arch::asm!("/* {0} */", inout(ymm_reg) sum_0, options(pure, nomem, nostack, preserves_flags));
+            acc_0 = _mm256_add_epi64(acc_0, sum_0);
 
             _mm256_storeu_si256(acc.add(i), acc_0);
         }

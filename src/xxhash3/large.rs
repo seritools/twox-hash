@@ -197,14 +197,13 @@ where
 
     #[inline]
     fn round_accumulate(&self, acc: &mut [u64; 8], stripes: &[[u8; 64]], secret: &Secret) {
-        let secrets = (0..stripes.len()).map(|i| {
-            // Safety: The number of stripes is determined by the
-            // block size, which is determined by the secret size.
-            unsafe { secret.stripe(i) }
-        });
-
-        for (stripe, secret) in stripes.iter().zip(secrets) {
-            self.0.accumulate(acc, stripe, secret);
+        let mut sp = unsafe { secret.stripe(0) }.as_ptr();
+        let mut p = stripes.as_ptr();
+        let end = p.wrapping_add(stripes.len());
+        while p != end {
+            unsafe { self.0.accumulate(acc, &*p, &*sp.cast()) };
+            p = p.wrapping_add(1);
+            sp = sp.wrapping_add(8);
         }
     }
 
